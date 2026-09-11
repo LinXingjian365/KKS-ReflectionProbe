@@ -6,7 +6,7 @@ using UnityEngine;
 
 namespace KKS_ReflectionProbe
 {
-    [BepInPlugin("com.user.kks_reflectionprobe", "KKS Realtime Reflection Probe", "1.2.0")]
+    [BepInPlugin("com.user.kks_reflectionprobe", "KKS Realtime Reflection Probe", "1.3.0")]
     public class ReflectionProbePlugin : BaseUnityPlugin
     {
         public static ManualLogSource Log;
@@ -27,6 +27,11 @@ namespace KKS_ReflectionProbe
         public static ConfigEntry<KeyboardShortcut> UIKey;
         public static ConfigEntry<float> Intensity;
         public static ConfigEntry<bool> UseSceneOrigin;
+        public static ConfigEntry<bool> UseTimeSlicing;
+        public static ConfigEntry<bool> UpdateOnCameraMotion;
+        public static ConfigEntry<float> CameraMoveThreshold;
+        public static ConfigEntry<float> CameraRotateThreshold;
+        public static ConfigEntry<float> StaticRefreshSeconds;
 
         private GameObject _probeObj;
         private ReflectionProbe _probe;
@@ -37,6 +42,20 @@ namespace KKS_ReflectionProbe
         private Vector2 _scroll;
         private float _nextDiagnostic;
         private int _renderCount;
+        private int _failedRenderCount;
+        private Vector3 _lastCameraPosition;
+        private Quaternion _lastCameraRotation;
+        private bool _hasCameraSample;
+        private float _nextRefreshTime;
+        private int _appliedResolution = -1;
+        private float _appliedProbeHeight = float.NaN;
+        private float _appliedBoxX = float.NaN;
+        private float _appliedBoxY = float.NaN;
+        private float _appliedBoxZ = float.NaN;
+        private float _appliedNearClip = float.NaN;
+        private float _appliedFarClip = float.NaN;
+        private float _appliedIntensity = float.NaN;
+        private bool _appliedTimeSlicing;
 
         private void Awake()
         {
@@ -54,10 +73,15 @@ namespace KKS_ReflectionProbe
             FarClip = Config.Bind("Performance", "FarClip", 200f, "Probe camera far clip");
             Intensity = Config.Bind("General", "Intensity", 1.0f, "Reflection intensity multiplier");
             UseSceneOrigin = Config.Bind("General", "UseSceneOrigin", true, "Place probe at scene origin instead of camera position");
+            UseTimeSlicing = Config.Bind("Performance", "UseTimeSlicing", true, "Render one cubemap face at a time to avoid frame-time spikes");
+            UpdateOnCameraMotion = Config.Bind("Performance", "UpdateOnCameraMotion", true, "Refresh immediately after the camera moves");
+            CameraMoveThreshold = Config.Bind("Performance", "CameraMoveThreshold", 0.05f, "Camera movement in meters required to trigger a refresh");
+            CameraRotateThreshold = Config.Bind("Performance", "CameraRotateThreshold", 0.5f, "Camera rotation in degrees required to trigger a refresh");
+            StaticRefreshSeconds = Config.Bind("Performance", "StaticRefreshSeconds", 1.0f, "Refresh interval while the camera is static");
             ToggleKey = Config.Bind("Hotkeys", "ToggleProbe", new KeyboardShortcut(KeyCode.R, KeyCode.LeftControl), "Toggle reflection probe");
             UIKey = Config.Bind("Hotkeys", "ToggleUI", new KeyboardShortcut(KeyCode.R, KeyCode.LeftAlt), "Toggle config UI");
 
-            Logger.LogInfo("KKS Reflection Probe v1.2.0 loaded - Ctrl+R toggle, Alt+R config");
+            Logger.LogInfo("KKS Reflection Probe v1.3.0 loaded - Ctrl+R toggle, Alt+R config");
         }
 
         private void Update()
@@ -66,7 +90,11 @@ namespace KKS_ReflectionProbe
             {
                 EnableProbe.Value = !EnableProbe.Value;
                 Logger.LogInfo("Reflection probe " + (EnableProbe.Value ? "enabled" : "disabled"));
-                if (!EnableProbe.Value) _frameCount = 0;
+                if (!EnableProbe.Value)
+                {
+                    _frameCount = 0;
+                    _hasCameraSample = false;
+                }
             }
             if (UIKey.Value.IsDown())
             {
@@ -75,8 +103,16 @@ namespace KKS_ReflectionProbe
 
             if (EnableProbe.Value)
             {
-                EnsureProbe();
-                UpdateProbe();
+                try
+                {
+                    EnsureProbe();
+                    UpdateProbe();
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError("Reflection probe update failed; removing probe safely: " + ex.GetType().Name + ": " + ex.Message);
+                    RemoveProbe();
+                }
             }
             else
             {
@@ -94,7 +130,9 @@ namespace KKS_ReflectionProbe
 
             _probe.mode = UnityEngine.Rendering.ReflectionProbeMode.Realtime;
             _probe.refreshMode = UnityEngine.Rendering.ReflectionProbeRefreshMode.ViaScripting;
-            _probe.timeSlicingMode = UnityEngine.Rendering.ReflectionProbeTimeSlicingMode.AllFacesAtOnce;
+            _probe.timeSlicingMode = UseTimeSlicing.Value
+                ? UnityEngine.Rendering.ReflectionProbeTimeSlicingMode.IndividualFaces
+                : UnityEngine.Rendering.ReflectionProbeTimeSlicingMode.AllFacesAtOnce;
             _probe.hdr = true;
             _probe.boxProjection = true;
             _probe.importance = 10;
@@ -112,12 +150,36 @@ namespace KKS_ReflectionProbe
         {
             if (_probe == null) return;
 
-            _probe.resolution = Resolution.Value;
-            _probe.nearClipPlane = NearClip.Value;
-            _probe.farClipPlane = FarClip.Value;
-            _probe.intensity = Intensity.Value;
-            _probe.center = new Vector3(0, BoxSizeY.Value * 0.5f, 0);
-            _probe.size = new Vector3(BoxSizeX.Value, BoxSizeY.Value, BoxSizeZ.Value);
+            bool changed = _appliedResolution != Resolution.Value
+                || !Mathf.Approximately(_appliedProbeHeight, ProbeHeight.Value)
+                || !Mathf.Approximately(_appliedBoxX, BoxSizeX.Value)
+                || !Mathf.Approximately(_appliedBoxY, BoxSizeY.Value)
+                || !Mathf.Approximately(_appliedBoxZ, BoxSizeZ.Value)
+                || !Mathf.Approximately(_appliedNearClip, NearClip.Value)
+                || !Mathf.Approximately(_appliedFarClip, FarClip.Value)
+                || !Mathf.Approximately(_appliedIntensity, Intensity.Value)
+                || _appliedTimeSlicing != UseTimeSlicing.Value;
+            if (!changed) return;
+
+            _probe.resolution = Mathf.ClosestPowerOfTwo(Mathf.Clamp(Resolution.Value, 128, 2048));
+            _probe.nearClipPlane = Mathf.Max(0.01f, NearClip.Value);
+            _probe.farClipPlane = Mathf.Max(_probe.nearClipPlane + 1f, FarClip.Value);
+            _probe.intensity = Mathf.Clamp(Intensity.Value, 0f, 3f);
+            _probe.center = new Vector3(0, Mathf.Max(1f, BoxSizeY.Value) * 0.5f, 0);
+            _probe.size = new Vector3(Mathf.Max(1f, BoxSizeX.Value), Mathf.Max(1f, BoxSizeY.Value), Mathf.Max(1f, BoxSizeZ.Value));
+            _probe.timeSlicingMode = UseTimeSlicing.Value
+                ? UnityEngine.Rendering.ReflectionProbeTimeSlicingMode.IndividualFaces
+                : UnityEngine.Rendering.ReflectionProbeTimeSlicingMode.AllFacesAtOnce;
+
+            _appliedResolution = Resolution.Value;
+            _appliedProbeHeight = ProbeHeight.Value;
+            _appliedBoxX = BoxSizeX.Value;
+            _appliedBoxY = BoxSizeY.Value;
+            _appliedBoxZ = BoxSizeZ.Value;
+            _appliedNearClip = NearClip.Value;
+            _appliedFarClip = FarClip.Value;
+            _appliedIntensity = Intensity.Value;
+            _appliedTimeSlicing = UseTimeSlicing.Value;
 
             // Shadow distance for probe camera
             var probeCam = _probe.GetComponent<Camera>();
@@ -132,8 +194,23 @@ namespace KKS_ReflectionProbe
             if (_probe == null) return;
 
             _frameCount++;
-            if (_frameCount < UpdateEveryNFrames.Value) return;
+            int frameInterval = Mathf.Max(1, UpdateEveryNFrames.Value);
+            if (_frameCount < frameInterval) return;
             _frameCount = 0;
+
+            Camera cameraForMotion = Camera.main;
+            bool cameraMoved = false;
+            if (cameraForMotion != null)
+            {
+                cameraMoved = !_hasCameraSample
+                    || Vector3.Distance(cameraForMotion.transform.position, _lastCameraPosition) >= Mathf.Max(0f, CameraMoveThreshold.Value)
+                    || Quaternion.Angle(cameraForMotion.transform.rotation, _lastCameraRotation) >= Mathf.Max(0f, CameraRotateThreshold.Value);
+                _lastCameraPosition = cameraForMotion.transform.position;
+                _lastCameraRotation = cameraForMotion.transform.rotation;
+                _hasCameraSample = true;
+            }
+            bool refreshDue = Time.unscaledTime >= _nextRefreshTime;
+            if (UpdateOnCameraMotion.Value && !cameraMoved && !refreshDue) return;
 
             // Position probe
             if (UseSceneOrigin.Value)
@@ -151,21 +228,27 @@ namespace KKS_ReflectionProbe
                 }
             }
 
-            // Apply config changes
             ApplyConfig();
 
             // Render probe
+            float requestStart = Time.realtimeSinceStartup;
             int renderResult = _probe.RenderProbe();
+            float requestMs = (Time.realtimeSinceStartup - requestStart) * 1000f;
             _renderCount++;
+            if (renderResult == 0) _failedRenderCount++;
+            _nextRefreshTime = Time.unscaledTime + Mathf.Max(0.1f, StaticRefreshSeconds.Value);
             if (Time.unscaledTime >= _nextDiagnostic)
             {
-                _nextDiagnostic = Time.unscaledTime + 5f;
+                _nextDiagnostic = Time.unscaledTime + 10f;
                 var texture = _probe.texture;
                 Logger.LogInfo("Reflection probe render #" + _renderCount + ": result=" + renderResult +
                     ", enabled=" + _probe.enabled + ", mode=" + _probe.mode + ", refresh=" + _probe.refreshMode +
                     ", position=" + _probeObj.transform.position +
                     ", texture=" + (texture != null ? texture.width + "x" + texture.height : "null") +
-                    ", intensity=" + _probe.intensity);
+                    ", intensity=" + _probe.intensity +
+                    ", timeSlicing=" + _probe.timeSlicingMode +
+                    ", requestMs=" + requestMs.ToString("F2") +
+                    ", failed=" + _failedRenderCount);
             }
         }
 
@@ -176,6 +259,8 @@ namespace KKS_ReflectionProbe
                 Destroy(_probeObj);
                 _probeObj = null;
                 _probe = null;
+                _hasCameraSample = false;
+                _nextRefreshTime = 0f;
                 Logger.LogInfo("Reflection probe removed");
             }
         }
@@ -216,6 +301,12 @@ namespace KKS_ReflectionProbe
             GUILayout.Label("Update Every N Frames: " + UpdateEveryNFrames.Value);
             UpdateEveryNFrames.Value = (int)GUILayout.HorizontalSlider(UpdateEveryNFrames.Value, 1, 10);
 
+            UpdateOnCameraMotion.Value = GUILayout.Toggle(UpdateOnCameraMotion.Value, "  Refresh on camera motion");
+            UseTimeSlicing.Value = GUILayout.Toggle(UseTimeSlicing.Value, "  Time-slice cubemap faces");
+
+            GUILayout.Label("Static refresh: " + StaticRefreshSeconds.Value.ToString("F1") + " s");
+            StaticRefreshSeconds.Value = GUILayout.HorizontalSlider(StaticRefreshSeconds.Value, 0.1f, 5f);
+
             GUILayout.Label("Far Clip: " + FarClip.Value.ToString("F0"));
             FarClip.Value = GUILayout.HorizontalSlider(FarClip.Value, 50f, 500f);
 
@@ -231,6 +322,9 @@ namespace KKS_ReflectionProbe
                 BoxSizeY.Value = 30f;
                 BoxSizeZ.Value = 50f;
                 UpdateEveryNFrames.Value = 3;
+                UpdateOnCameraMotion.Value = true;
+                UseTimeSlicing.Value = true;
+                StaticRefreshSeconds.Value = 1.0f;
                 FarClip.Value = 200f;
                 UseSceneOrigin.Value = true;
             }

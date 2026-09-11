@@ -9,9 +9,11 @@ Realtime Unity Built-in reflection probe helper for Koikatsu Sunshine CharaStudi
 
 The probe uses Unity's native `ReflectionProbe` component. It does not use ReShade and it does not replace KKS materials. Only materials/shaders that read Unity reflection probes can show the result.
 
-## Diagnostics
+## Performance and diagnostics
 
-The plugin logs a render result, probe position, cubemap size, enabled state, and texture state every five seconds. `result=0` is the first value to inspect if the toggle appears to do nothing.
+The probe can refresh after camera movement and at a slower interval while the camera is static. Cubemap faces are time-sliced by default so a 512px probe does not submit all six faces in one frame. `UpdateEveryNFrames` still provides a hard frame gate, while `StaticRefreshSeconds` limits refreshes when the view is unchanged.
+
+The plugin logs a render result, probe position, cubemap size, time-slicing mode, request time, and failed request count every ten seconds. `result=0` is the first value to inspect if the toggle appears to do nothing.
 
 ## Build
 
