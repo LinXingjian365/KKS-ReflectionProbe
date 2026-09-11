@@ -6,7 +6,7 @@ using UnityEngine;
 
 namespace KKS_ReflectionProbe
 {
-    [BepInPlugin("com.user.kks_reflectionprobe", "KKS Realtime Reflection Probe", "1.3.0")]
+    [BepInPlugin("com.user.kks_reflectionprobe", "KKS Realtime Reflection Probe", "1.3.1")]
     public class ReflectionProbePlugin : BaseUnityPlugin
     {
         public static ManualLogSource Log;
@@ -235,13 +235,14 @@ namespace KKS_ReflectionProbe
             int renderResult = _probe.RenderProbe();
             float requestMs = (Time.realtimeSinceStartup - requestStart) * 1000f;
             _renderCount++;
-            if (renderResult == 0) _failedRenderCount++;
+            // Unity returns a render request ID; negative means the request failed.
+            if (renderResult < 0) _failedRenderCount++;
             _nextRefreshTime = Time.unscaledTime + Mathf.Max(0.1f, StaticRefreshSeconds.Value);
             if (Time.unscaledTime >= _nextDiagnostic)
             {
                 _nextDiagnostic = Time.unscaledTime + 10f;
                 var texture = _probe.texture;
-                Logger.LogInfo("Reflection probe render #" + _renderCount + ": result=" + renderResult +
+                Logger.LogInfo("Reflection probe render #" + _renderCount + ": renderId=" + renderResult +
                     ", enabled=" + _probe.enabled + ", mode=" + _probe.mode + ", refresh=" + _probe.refreshMode +
                     ", position=" + _probeObj.transform.position +
                     ", texture=" + (texture != null ? texture.width + "x" + texture.height : "null") +

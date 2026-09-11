@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.3.1
+
+- Corrected diagnostics to treat `RenderProbe()` as a render request ID (`< 0` is failure), not a boolean result.
+- Renamed the logged field to `renderId` and documented the initial time-sliced `texture=null` state.
+
 ## v1.3.0
 
 - Added camera-motion-aware refresh scheduling with a static-scene refresh interval.
